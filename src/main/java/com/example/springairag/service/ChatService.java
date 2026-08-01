@@ -1,8 +1,6 @@
 package com.example.springairag.service;
 
-import com.example.springairag.dto.TimeFilter;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.example.springairag.dto.QueryIntent;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -11,7 +9,6 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.*;
 import java.util.*;
-import java.util.regex.*;
 
 @Service
 public class ChatService {
@@ -19,8 +16,6 @@ public class ChatService {
     private final JdbcTemplate jdbcTemplate;
     private final EmbeddingService embeddingService;
     private final ChatClient chatClient;
-
-    private final ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
     public ChatService(JdbcTemplate jdbcTemplate,
                        EmbeddingService embeddingService,
@@ -30,179 +25,231 @@ public class ChatService {
         this.chatClient = builder.build();
     }
 
-    // 🔥 MAIN METHOD
+    // ================= MAIN =================
     public String ask(String query) {
 
-        System.out.println("🚀 Query: " + query);
+        System.out.println("🚀 QUERY: " + query);
 
         try {
-            // ✅ STEP 1: TIME EXTRACTION
-            TimeFilter timeFilter = extractTimeHybrid(query);
+            // 🔥 STEP 1: Extract intent (AI)
+            QueryIntent intent = extractIntent(query);
 
-            System.out.println("🧠 START: " + (timeFilter != null ? timeFilter.getStart() : null));
-            System.out.println("🧠 END: " + (timeFilter != null ? timeFilter.getEnd() : null));
+            // 🔥 STEP 2: Extract date (HYBRID: AI + RULES)
+            LocalDateTime[] range = extractDateRange(query, intent);
 
-            // 🚨 STOP if invalid
-            if (timeFilter == null ||
-                timeFilter.getStart() == null ||
-                timeFilter.getEnd() == null) {
+            LocalDateTime start = range[0];
+            LocalDateTime end = range[1];
 
-                return "❌ Could not understand date. Try '10 March' or 'yesterday'.";
-            }
+            System.out.println("📅 START: " + start);
+            System.out.println("📅 END: " + end);
 
-            // ✅ STEP 2: EMBEDDING
-            float[] vector = embeddingService.generateEmbedding(query);
-            String vectorString = toPgVector(vector);
-
-            // ✅ STEP 3: SQL (FIXED)
-            String sql = """
+            // 🔥 STEP 3: Build SQL (SAFE + FAST)
+            StringBuilder sql = new StringBuilder("""
                 SELECT message, start_time
-                FROM (
-                    SELECT *
-                    FROM cc_alerts_alert
-                    WHERE is_active = true
-                    AND start_time >= ? AND start_time <= ?
-                    ORDER BY start_time DESC
-                    LIMIT 100
-                ) sub
-                ORDER BY embedding <=> ?::vector
-                LIMIT 20
-            """;
+                FROM cc_alerts_alert
+                WHERE is_active = true
+            """);
 
             List<Object> params = new ArrayList<>();
-            params.add(timeFilter.getStart());
-            params.add(timeFilter.getEnd());
-            params.add(vectorString);
 
-            List<String> results = jdbcTemplate.query(
-                    sql,
-                    (rs, rowNum) -> mapRow(rs),
+            if (start != null && end != null) {
+                sql.append(" AND start_time >= ? AND start_time <= ?");
+                params.add(start);
+                params.add(end);
+            }
+
+            // 🔥 OBJECT FILTER
+            if (intent.getObject() != null) {
+                sql.append(" AND message ILIKE ?");
+                params.add("%" + intent.getObject() + "%");
+            }
+
+            // 🔥 VECTOR SEARCH (only for similarity queries)
+            if (intent.isUseVector()) {
+                float[] vec = embeddingService.generateEmbedding(query);
+                sql.append(" ORDER BY embedding <=> CAST(? AS vector)");
+                params.add(toPgVector(vec));
+            } else {
+                sql.append(" ORDER BY start_time DESC");
+            }
+
+            sql.append(" LIMIT 20");
+
+            List<String> rows = jdbcTemplate.query(
+                    sql.toString(),
+                    (rs, i) -> mapRow(rs),
                     params.toArray()
             );
 
-            System.out.println("📊 Rows: " + results.size());
-
-            if (results.isEmpty()) {
-                return "No data found for given date.";
+            if (rows.isEmpty()) {
+                return "No relevant data found.";
             }
 
-            // ✅ STEP 4: CONTEXT
-            String context = String.join("\n", results);
+            // 🔥 STEP 4: Response by type
+            switch (intent.getType()) {
+                case "COUNT":
+                    return "Total incidents: " + rows.size();
 
-            // ✅ STEP 5: AI RESPONSE
-            return chatClient
-                    .prompt()
-                    .user("""
-                        You are a construction monitoring AI.
+                case "LIST":
+                    return String.join("\n", rows);
 
-                        Answer ONLY from the data.
-
-                        - Group similar events
-                        - Remove duplicates
-                        - If "when" → include time
-                        - If "how many" → count
-
-                        Data:
-                        """ + context + """
-
-                        Question:
-                        """ + query)
-                    .call()
-                    .content();
+                case "COMPARE":
+                case "ANALYZE":
+                case "SUMMARY":
+                default:
+                    return summarize(rows, query);
+            }
 
         } catch (Exception e) {
             e.printStackTrace();
-            return "Error processing request.";
+            return "Error processing query.";
         }
     }
 
-    // 🧠 HYBRID EXTRACTION
-    private TimeFilter extractTimeHybrid(String query) {
+    // ================= INTENT =================
+    private QueryIntent extractIntent(String query) {
 
-        TimeFilter regex = extractUsingRegex(query);
-        if (regex != null) {
-            System.out.println("⚡ Regex used");
-            return regex;
-        }
-
-        // ❌ KEEP AI as LAST fallback (optional)
         try {
-            String response = chatClient
-                    .prompt()
-                    .user("""
-                        Extract time range from query.
+            return chatClient.prompt().user("""
+                Extract structured intent.
 
-                        Return ONLY JSON:
-                        {"start":"2026-03-10T00:00:00","end":"2026-03-10T23:59:59"}
+                Return JSON ONLY:
+                {
+                  "type": "COUNT | LIST | SUMMARY | COMPARE | ANALYZE",
+                  "object": "gun | fire | knife | smoke | person | null",
+                  "useVector": true/false
+                }
 
-                        Query:
-                        """ + query)
+                RULES:
+                - "how many" → COUNT
+                - "show/list" → LIST
+                - "highest/most" → COMPARE
+                - "why/explain" → ANALYZE
+                - else → SUMMARY
+
+                Query:
+                """ + query)
                     .call()
-                    .content();
-
-            System.out.println("🧠 AI RAW: " + response);
-
-            return mapper.readValue(response, TimeFilter.class);
+                    .entity(QueryIntent.class);
 
         } catch (Exception e) {
-            System.out.println("⚠️ AI failed");
-            return null;
+            QueryIntent fallback = new QueryIntent();
+            fallback.setType("SUMMARY");
+            fallback.setUseVector(true);
+            return fallback;
         }
     }
 
-    // ⚡ REGEX (PRIMARY)
-    private TimeFilter extractUsingRegex(String query) {
+    // ================= DATE ENGINE =================
+    private LocalDateTime[] extractDateRange(String query, QueryIntent intent) {
 
         query = query.toLowerCase();
 
+        LocalDate today = LocalDate.now();
+
         try {
-            // today
+            // ✅ TODAY
             if (query.contains("today")) {
-                LocalDate d = LocalDate.now();
-                return new TimeFilter(d.atStartOfDay(), d.atTime(23,59,59));
+                return new LocalDateTime[]{
+                        today.atStartOfDay(),
+                        today.atTime(23, 59, 59)
+                };
             }
 
-            // yesterday
+            // ✅ YESTERDAY
             if (query.contains("yesterday")) {
-                LocalDate d = LocalDate.now().minusDays(1);
-                return new TimeFilter(d.atStartOfDay(), d.atTime(23,59,59));
-            }
-
-            // 10 March
-            Pattern p = Pattern.compile("(\\d{1,2})\\s+(\\w+)");
-            Matcher m = p.matcher(query);
-
-            if (m.find()) {
-                int day = Integer.parseInt(m.group(1));
-                String monthStr = m.group(2).substring(0,3).toUpperCase();
-
-                Month month = Month.valueOf(monthStr);
-
-                int year = LocalDate.now().getYear(); // ✅ FIXED (dynamic year)
-
-                LocalDate d = LocalDate.of(year, month, day);
-
-                return new TimeFilter(
+                LocalDate d = today.minusDays(1);
+                return new LocalDateTime[]{
                         d.atStartOfDay(),
                         d.atTime(23, 59, 59)
-                );
+                };
             }
 
-        } catch (Exception e) {
-            System.out.println("⚠️ Regex failed");
-        }
+            // ✅ THIS MONTH
+            if (query.contains("this month")) {
+                LocalDate start = today.withDayOfMonth(1);
+                LocalDate end = today;
+                return new LocalDateTime[]{
+                        start.atStartOfDay(),
+                        end.atTime(23, 59, 59)
+                };
+            }
 
-        return null;
+            // ✅ LAST MONTH
+            if (query.contains("last month")) {
+                LocalDate lastMonth = today.minusMonths(1);
+                LocalDate start = lastMonth.withDayOfMonth(1);
+                LocalDate end = lastMonth.withDayOfMonth(lastMonth.lengthOfMonth());
+
+                return new LocalDateTime[]{
+                        start.atStartOfDay(),
+                        end.atTime(23, 59, 59)
+                };
+            }
+
+            // ✅ THIS WEEK
+            if (query.contains("this week")) {
+                LocalDate start = today.minusDays(today.getDayOfWeek().getValue() - 1);
+                return new LocalDateTime[]{
+                        start.atStartOfDay(),
+                        today.atTime(23, 59, 59)
+                };
+            }
+
+            // ✅ 10 March
+            String[] months = {"jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"};
+
+            for (int i = 0; i < months.length; i++) {
+                if (query.contains(months[i])) {
+
+                    int month = i + 1;
+                    int day = Integer.parseInt(query.replaceAll("\\D+", ""));
+
+                    LocalDate d = LocalDate.of(today.getYear(), month, day);
+
+                    return new LocalDateTime[]{
+                            d.atStartOfDay(),
+                            d.atTime(23, 59, 59)
+                    };
+                }
+            }
+
+        } catch (Exception ignored) {}
+
+        // 🔥 FALLBACK (never fail)
+        LocalDateTime end = LocalDateTime.now();
+        LocalDateTime start = end.minusDays(7);
+
+        return new LocalDateTime[]{start, end};
     }
 
-    // 🔄 MAPPER
+    // ================= SUMMARY =================
+    private String summarize(List<String> rows, String query) {
+
+        String context = String.join("\n", rows);
+
+        return chatClient.prompt().user("""
+            Answer using ONLY the data.
+
+            - Group similar events
+            - Remove duplicates
+            - Be precise
+
+            Data:
+            """ + context + """
+
+            Question:
+            """ + query)
+                .call()
+                .content();
+    }
+
+    // ================= MAPPER =================
     private String mapRow(ResultSet rs) throws SQLException {
-        return rs.getString("message") +
-                " at " +
-                rs.getTimestamp("start_time");
+        return rs.getString("message") + " at " + rs.getTimestamp("start_time");
     }
 
-    // 🔧 VECTOR FORMAT
+    // ================= VECTOR =================
     private String toPgVector(float[] vector) {
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < vector.length; i++) {

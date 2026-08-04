@@ -1,14 +1,12 @@
 package com.example.springairag.dto;
 
-import java.time.LocalDateTime;
-
 public class QueryIntent {
 
-    private String type;         // COUNT / LIST / SUMMARY / SIMILAR / AGG
-    private String object;       // gun, fire, knife
-    private LocalDateTime start;
-    private LocalDateTime end;
+    private String type;
+    private String object;
     private boolean useVector;
+    private boolean needJoin;
+    private String aggregation;
     public String getType() {
         return type;
     }
@@ -21,23 +19,23 @@ public class QueryIntent {
     public void setObject(String object) {
         this.object = object;
     }
-    public LocalDateTime getStart() {
-        return start;
-    }
-    public void setStart(LocalDateTime start) {
-        this.start = start;
-    }
-    public LocalDateTime getEnd() {
-        return end;
-    }
-    public void setEnd(LocalDateTime end) {
-        this.end = end;
-    }
     public boolean isUseVector() {
         return useVector;
     }
     public void setUseVector(boolean useVector) {
         this.useVector = useVector;
+    }
+    public boolean isNeedJoin() {
+        return needJoin;
+    }
+    public void setNeedJoin(boolean needJoin) {
+        this.needJoin = needJoin;
+    }
+    public String getAggregation() {
+        return aggregation;
+    }
+    public void setAggregation(String aggregation) {
+        this.aggregation = aggregation;
     }
 
     // getters & setters

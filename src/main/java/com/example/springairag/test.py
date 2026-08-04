@@ -1,11 +1,24 @@
 import requests
 import psycopg2
+import time
 
-def trim(val, limit=150):
-    if val is None:
-        return ""
-    val = str(val)
-    return val[:limit]
+EMBED_URL = "http://localhost:11434/api/embeddings"
+MODEL = "nomic-embed-text"
+BATCH = 50
+
+
+def embed(text):
+    res = requests.post(EMBED_URL, json={
+        "model": MODEL,
+        "prompt": text[:1000]
+    })
+    data = res.json()
+    return data.get("embedding")
+
+
+def to_vec(arr):
+    return "[" + ",".join(map(str, arr)) + "]"
+
 
 conn = psycopg2.connect(
     dbname="ai_db",
@@ -14,76 +27,87 @@ conn = psycopg2.connect(
     host="localhost",
     port="5433"
 )
-
 cur = conn.cursor()
 
 cur.execute("""
-    SELECT id, message, inference_analysis, 
-           llm_response_id, severity, detection_class, 
-           confidence, alert_analysis, latitude, 
-           longitude, start_time, end_time, duration, 
-           is_resolved, resolved_at, resolution_notes, 
-           is_active, resolved_by_id
-    FROM public.cc_alerts_alert
-    WHERE embedding IS NULL
+SELECT 
+    a.id,
+    a.message,
+    a.inference_analysis,
+    l.incident_category,
+    l.risk_assessment,
+    l.recommended_action,
+    l.next_action
+FROM cc_alerts_alert a
+LEFT JOIN cc_alerts_alertllmresponse l
+ON a.llm_response_id = l.id
+WHERE a.embedding_event IS NULL
+LIMIT 5000
 """)
 
 rows = cur.fetchall()
 
+count = 0
+
 for row in rows:
     (
-        id, message, inference_analysis, llm_response_id,
-        severity, detection_class, confidence, alert_analysis,
-        latitude, longitude, start_time, end_time, duration,
-        is_resolved, resolved_at, resolution_notes,
-        is_active, resolved_by_id
+        id,
+        message,
+        inference,
+        category,
+        risk,
+        action,
+        next_action
     ) = row
 
-    # 🧠 Compact structured text (ALL columns included)
-    text = f"""
-    Msg:{trim(message)}
-    Inf:{trim(inference_analysis)}
-    Alert:{trim(alert_analysis)}
-    Sev:{severity}
-    Class:{detection_class}
-    Conf:{confidence}
-    Loc:{latitude},{longitude}
-    Start:{start_time}
-    End:{end_time}
-    Dur:{duration}
-    Resolved:{is_resolved}
-    ResolvedAt:{resolved_at}
-    Notes:{trim(resolution_notes)}
-    Active:{is_active}
-    By:{resolved_by_id}
+    # 🔥 1. EVENT EMBEDDING
+    event_text = f"""
+    {message}
+    {inference}
+    Category: {category}
     """
 
-    # Final safety limit
-    text = text[:1200]
+    # 🔥 2. RISK EMBEDDING
+    risk_text = f"""
+    Risk: {risk}
+    Category: {category}
+    """
 
-    res = requests.post(
-        "http://localhost:11434/api/embeddings",
-        json={
-            "model": "nomic-embed-text",
-            "prompt": text
-        }
-    )
+    # 🔥 3. ACTION EMBEDDING
+    action_text = f"""
+    Action: {action}
+    Next: {next_action}
+    """
 
-    data = res.json()
+    e1 = embed(event_text)
+    e2 = embed(risk_text)
+    e3 = embed(action_text)
 
-    if "embedding" not in data:
-        print("Error:", data)
+    if not e1 or not e2 or not e3:
+        print("❌ Skip", id)
         continue
 
-    embedding = data["embedding"]
-    embedding_str = "[" + ",".join(map(str, embedding)) + "]"
-
     cur.execute("""
-        UPDATE public.cc_alerts_alert
-        SET embedding = %s
-        WHERE id = %s
-    """, (embedding_str, id))
+    UPDATE cc_alerts_alert
+    SET embedding_event = %s,
+        embedding_risk = %s,
+        embedding_action = %s
+    WHERE id = %s
+    """, (
+        to_vec(e1),
+        to_vec(e2),
+        to_vec(e3),
+        id
+    ))
+
+    count += 1
+
+    if count % BATCH == 0:
+        conn.commit()
+        print(f"✅ {count} updated")
 
 conn.commit()
 cur.close()
 conn.close()
+
+print("🔥 DONE:", count)

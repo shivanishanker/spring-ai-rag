@@ -1,13 +1,14 @@
 package com.example.springairag.service;
 
 import com.example.springairag.dto.QueryIntent;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.time.*;
+import java.time.LocalDateTime;
 import java.util.*;
 
 @Service
@@ -16,6 +17,7 @@ public class ChatService {
     private final JdbcTemplate jdbcTemplate;
     private final EmbeddingService embeddingService;
     private final ChatClient chatClient;
+    private final ObjectMapper mapper = new ObjectMapper();
 
     public ChatService(JdbcTemplate jdbcTemplate,
                        EmbeddingService embeddingService,
@@ -28,225 +30,173 @@ public class ChatService {
     // ================= MAIN =================
     public String ask(String query) {
 
-        System.out.println("🚀 QUERY: " + query);
-
         try {
-            // 🔥 STEP 1: Extract intent (AI)
-            QueryIntent intent = extractIntent(query);
 
-            // 🔥 STEP 2: Extract date (HYBRID: AI + RULES)
-            LocalDateTime[] range = extractDateRange(query, intent);
+            System.out.println("🚀 USER QUERY: " + query);
 
-            LocalDateTime start = range[0];
-            LocalDateTime end = range[1];
+            QueryIntent intent = parseIntent(query);
+            LocalDateTime[] range = extractDate(query);
 
-            System.out.println("📅 START: " + start);
-            System.out.println("📅 END: " + end);
+            float[] vector = embeddingService.generateEmbedding(query);
+            String vec = toPgVector(vector);
 
-            // 🔥 STEP 3: Build SQL (SAFE + FAST)
-            StringBuilder sql = new StringBuilder("""
-                SELECT message, start_time
-                FROM cc_alerts_alert
-                WHERE is_active = true
-            """);
+            String sql = buildSQL(query, intent, range);
 
-            List<Object> params = new ArrayList<>();
+            List<Object> params = buildParams(query, intent, range, vec);
 
-            if (start != null && end != null) {
-                sql.append(" AND start_time >= ? AND start_time <= ?");
-                params.add(start);
-                params.add(end);
-            }
-
-            // 🔥 OBJECT FILTER
-            if (intent.getObject() != null) {
-                sql.append(" AND message ILIKE ?");
-                params.add("%" + intent.getObject() + "%");
-            }
-
-            // 🔥 VECTOR SEARCH (only for similarity queries)
-            if (intent.isUseVector()) {
-                float[] vec = embeddingService.generateEmbedding(query);
-                sql.append(" ORDER BY embedding <=> CAST(? AS vector)");
-                params.add(toPgVector(vec));
-            } else {
-                sql.append(" ORDER BY start_time DESC");
-            }
-
-            sql.append(" LIMIT 20");
+            System.out.println("🧠 SQL: " + sql);
+            System.out.println("🧠 PARAMS: " + params);
 
             List<String> rows = jdbcTemplate.query(
-                    sql.toString(),
+                    sql,
                     (rs, i) -> mapRow(rs),
                     params.toArray()
             );
 
             if (rows.isEmpty()) {
-                return "No relevant data found.";
+                return "{\"status\":\"empty\",\"message\":\"No data found\"}";
             }
 
-            // 🔥 STEP 4: Response by type
-            switch (intent.getType()) {
-                case "COUNT":
-                    return "Total incidents: " + rows.size();
+            String markdown = chatClient.prompt().user("""
+                Generate a markdown answer.
 
-                case "LIST":
-                    return String.join("\n", rows);
+                Data:
+                """ + String.join("\n", rows) + """
 
-                case "COMPARE":
-                case "ANALYZE":
-                case "SUMMARY":
-                default:
-                    return summarize(rows, query);
-            }
+                Question:
+                """ + query)
+            .call()
+            .content();
+
+            Map<String, Object> res = new HashMap<>();
+            res.put("status", "success");
+            res.put("count", rows.size());
+            res.put("data", rows);
+            res.put("answer_md", markdown);
+
+            return mapper.writeValueAsString(res);
 
         } catch (Exception e) {
             e.printStackTrace();
-            return "Error processing query.";
+            return "{\"status\":\"error\",\"message\":\"Failed\"}";
         }
+    }
+
+    // ================= SQL =================
+    private String buildSQL(String query, QueryIntent intent, LocalDateTime[] range) {
+
+        StringBuilder sql = new StringBuilder("""
+            SELECT 
+                a.message,
+                a.start_time,
+                l.incident_category,
+                l.risk_assessment
+            FROM cc_alerts_alert a
+            LEFT JOIN cc_alerts_alertllmresponse l 
+                ON a.llm_response_id = l.id
+            WHERE a.is_active = true
+        """);
+
+        // ✅ DATE
+        if (range != null) {
+            sql.append(" AND a.start_time BETWEEN ? AND ?");
+        }
+
+        // ✅ SPECIAL CASE: smoke but no flames
+        if (query.toLowerCase().contains("smoke")
+                && query.toLowerCase().contains("no")
+                && query.toLowerCase().contains("flame")) {
+
+            sql.append("""
+                AND a.message ILIKE '%smoke%'
+                AND a.message NOT ILIKE '%flame%'
+            """);
+
+        } else if (intent.getObject() != null) {
+            sql.append(" AND (a.message ILIKE ? OR l.incident_category ILIKE ?)");
+        }
+
+        sql.append(" ORDER BY a.start_time DESC LIMIT 20");
+
+        return sql.toString();
+    }
+
+    // ================= PARAMS =================
+    private List<Object> buildParams(String query,
+                                    QueryIntent intent,
+                                    LocalDateTime[] range,
+                                    String vec) {
+
+        List<Object> params = new ArrayList<>();
+
+        if (range != null) {
+            params.add(range[0]);
+            params.add(range[1]);
+        }
+
+        // ⚠️ IMPORTANT: Only add params if placeholders exist
+        if (intent.getObject() != null
+                && !(query.toLowerCase().contains("smoke")
+                && query.toLowerCase().contains("no"))) {
+
+            String pattern = "%" + intent.getObject() + "%";
+            params.add(pattern);
+            params.add(pattern);
+        }
+
+        return params;
     }
 
     // ================= INTENT =================
-    private QueryIntent extractIntent(String query) {
-
+    private QueryIntent parseIntent(String query) {
         try {
-            return chatClient.prompt().user("""
-                Extract structured intent.
-
-                Return JSON ONLY:
-                {
-                  "type": "COUNT | LIST | SUMMARY | COMPARE | ANALYZE",
-                  "object": "gun | fire | knife | smoke | person | null",
-                  "useVector": true/false
-                }
-
-                RULES:
-                - "how many" → COUNT
-                - "show/list" → LIST
-                - "highest/most" → COMPARE
-                - "why/explain" → ANALYZE
-                - else → SUMMARY
-
+            String res = chatClient.prompt().user("""
+                Extract intent JSON:
+                { "type":"LIST", "object":"gun" }
                 Query:
                 """ + query)
-                    .call()
-                    .entity(QueryIntent.class);
+            .call()
+            .content();
 
+            return mapper.readValue(res, QueryIntent.class);
         } catch (Exception e) {
-            QueryIntent fallback = new QueryIntent();
-            fallback.setType("SUMMARY");
-            fallback.setUseVector(true);
-            return fallback;
+            return new QueryIntent();
         }
     }
 
-    // ================= DATE ENGINE =================
-    private LocalDateTime[] extractDateRange(String query, QueryIntent intent) {
-
-        query = query.toLowerCase();
-
-        LocalDate today = LocalDate.now();
-
+    // ================= DATE =================
+    private LocalDateTime[] extractDate(String query) {
         try {
-            // ✅ TODAY
-            if (query.contains("today")) {
-                return new LocalDateTime[]{
-                        today.atStartOfDay(),
-                        today.atTime(23, 59, 59)
-                };
-            }
+            String res = chatClient.prompt().user("""
+                Extract date JSON:
+                {"start":"YYYY-MM-DD HH:mm:ss","end":"YYYY-MM-DD HH:mm:ss"}
+                Query:
+                """ + query)
+            .call()
+            .content();
 
-            // ✅ YESTERDAY
-            if (query.contains("yesterday")) {
-                LocalDate d = today.minusDays(1);
-                return new LocalDateTime[]{
-                        d.atStartOfDay(),
-                        d.atTime(23, 59, 59)
-                };
-            }
+            Map<?, ?> map = mapper.readValue(res, Map.class);
 
-            // ✅ THIS MONTH
-            if (query.contains("this month")) {
-                LocalDate start = today.withDayOfMonth(1);
-                LocalDate end = today;
-                return new LocalDateTime[]{
-                        start.atStartOfDay(),
-                        end.atTime(23, 59, 59)
-                };
-            }
+            return new LocalDateTime[]{
+                    LocalDateTime.parse(((String) map.get("start")).replace(" ", "T")),
+                    LocalDateTime.parse(((String) map.get("end")).replace(" ", "T"))
+            };
 
-            // ✅ LAST MONTH
-            if (query.contains("last month")) {
-                LocalDate lastMonth = today.minusMonths(1);
-                LocalDate start = lastMonth.withDayOfMonth(1);
-                LocalDate end = lastMonth.withDayOfMonth(lastMonth.lengthOfMonth());
-
-                return new LocalDateTime[]{
-                        start.atStartOfDay(),
-                        end.atTime(23, 59, 59)
-                };
-            }
-
-            // ✅ THIS WEEK
-            if (query.contains("this week")) {
-                LocalDate start = today.minusDays(today.getDayOfWeek().getValue() - 1);
-                return new LocalDateTime[]{
-                        start.atStartOfDay(),
-                        today.atTime(23, 59, 59)
-                };
-            }
-
-            // ✅ 10 March
-            String[] months = {"jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"};
-
-            for (int i = 0; i < months.length; i++) {
-                if (query.contains(months[i])) {
-
-                    int month = i + 1;
-                    int day = Integer.parseInt(query.replaceAll("\\D+", ""));
-
-                    LocalDate d = LocalDate.of(today.getYear(), month, day);
-
-                    return new LocalDateTime[]{
-                            d.atStartOfDay(),
-                            d.atTime(23, 59, 59)
-                    };
-                }
-            }
-
-        } catch (Exception ignored) {}
-
-        // 🔥 FALLBACK (never fail)
-        LocalDateTime end = LocalDateTime.now();
-        LocalDateTime start = end.minusDays(7);
-
-        return new LocalDateTime[]{start, end};
+        } catch (Exception e) {
+            return null;
+        }
     }
 
-    // ================= SUMMARY =================
-    private String summarize(List<String> rows, String query) {
-
-        String context = String.join("\n", rows);
-
-        return chatClient.prompt().user("""
-            Answer using ONLY the data.
-
-            - Group similar events
-            - Remove duplicates
-            - Be precise
-
-            Data:
-            """ + context + """
-
-            Question:
-            """ + query)
-                .call()
-                .content();
-    }
-
-    // ================= MAPPER =================
-    private String mapRow(ResultSet rs) throws SQLException {
-        return rs.getString("message") + " at " + rs.getTimestamp("start_time");
+    // ================= MAP =================
+    private String mapRow(ResultSet rs) {
+        try {
+            return rs.getString("message") +
+                    " | Category: " + rs.getString("incident_category") +
+                    " | Risk: " + rs.getString("risk_assessment") +
+                    " | Time: " + rs.getTimestamp("start_time");
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     // ================= VECTOR =================

@@ -1,6 +1,6 @@
 package com.example.springairag.service;
 
-import org.springframework.ai.embedding.*;
+import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -14,19 +14,17 @@ public class EmbeddingService {
         this.embeddingModel = embeddingModel;
     }
 
-   public float[] generateEmbedding(String text) {
+    public float[] generateEmbedding(String text) {
 
-    EmbeddingResponse response =
-            embeddingModel.embedForResponse(List.of(text));
+        List<Double> embedding = embeddingModel.embed(text);
 
-    List<Double> list = response.getResults().get(0).getOutput();
+        // 🔥 FIX: convert List<Double> → float[]
+        float[] result = new float[embedding.size()];
 
-    float[] vector = new float[list.size()];
+        for (int i = 0; i < embedding.size(); i++) {
+            result[i] = embedding.get(i).floatValue();
+        }
 
-    for (int i = 0; i < list.size(); i++) {
-        vector[i] = list.get(i).floatValue();
-    }
-
-    return vector;
+        return result;
     }
 }

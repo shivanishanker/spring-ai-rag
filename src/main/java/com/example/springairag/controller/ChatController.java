@@ -1,5 +1,6 @@
 package com.example.springairag.controller;
 import com.example.springairag.dto.ChatRequest;
+import com.example.springairag.dto.ChatResponse;
 import com.example.springairag.service.ChatService;
 import org.springframework.web.bind.annotation.*;
 
@@ -14,7 +15,7 @@ public class ChatController {
     }
 
     @PostMapping
-    public String chat(@RequestBody ChatRequest request) {
+    public ChatResponse chat(@RequestBody ChatRequest request) {
         System.out.println("🔥 Controller HIT");
         return service.ask(request.getQuery());
     }

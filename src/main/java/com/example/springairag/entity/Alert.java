@@ -26,10 +26,6 @@ public class Alert {
     @Column(name = "start_time")
     private OffsetDateTime startTime;
 
-    // 🔥 pgvector
-    @Column(columnDefinition = "vector(384)")
-    private float[] embedding;
-
     public UUID getId() {
         return id;
     }
@@ -86,13 +82,4 @@ public class Alert {
         this.startTime = startTime;
     }
 
-    public float[] getEmbedding() {
-        return embedding;
-    }
-
-    public void setEmbedding(float[] embedding) {
-        this.embedding = embedding;
-    }
-
-    // getters & setters
 }

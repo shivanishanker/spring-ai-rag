@@ -1,8 +1,9 @@
 package com.example.springairag.service;
 
+import com.example.springairag.dto.ChatResponse;
 import com.example.springairag.dto.QueryIntent;
+import com.example.springairag.provider.AiProvider;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -16,22 +17,23 @@ public class ChatService {
 
     private final JdbcTemplate jdbcTemplate;
     private final EmbeddingService embeddingService;
-    private final ChatClient chatClient;
+    private final AiProvider aiProvider;
     private final ObjectMapper mapper = new ObjectMapper();
 
     public ChatService(JdbcTemplate jdbcTemplate,
                        EmbeddingService embeddingService,
-                       ChatClient.Builder builder) {
+                       AiProvider aiProvider) {
         this.jdbcTemplate = jdbcTemplate;
         this.embeddingService = embeddingService;
-        this.chatClient = builder.build();
+        this.aiProvider = aiProvider;
     }
 
     // ================= MAIN =================
-    public String ask(String query) {
+    public ChatResponse ask(String query) {
+
+        ChatResponse response = new ChatResponse();
 
         try {
-
             System.out.println("🚀 USER QUERY: " + query);
 
             QueryIntent intent = parseIntent(query);
@@ -40,9 +42,9 @@ public class ChatService {
             float[] vector = embeddingService.generateEmbedding(query);
             String vec = toPgVector(vector);
 
-            String sql = buildSQL(query, intent, range);
+            String sql = buildSQL(intent, range);
 
-            List<Object> params = buildParams(query, intent, range, vec);
+            List<Object> params = buildParams(intent, range, vec);
 
             System.out.println("🧠 SQL: " + sql);
             System.out.println("🧠 PARAMS: " + params);
@@ -54,95 +56,111 @@ public class ChatService {
             );
 
             if (rows.isEmpty()) {
-                return "{\"status\":\"empty\",\"message\":\"No data found\"}";
+                response.setAnswer("No relevant data found.");
+                response.setSource("DB");
+                return response;
             }
 
-            String markdown = chatClient.prompt().user("""
-                Generate a markdown answer.
+            String context = String.join("\n", rows);
 
-                Data:
-                """ + String.join("\n", rows) + """
+            String markdown = aiProvider.generateAnswer(
+                    "Generate a concise markdown answer using ONLY the given data.",
+                    context,
+                    query
+            );
 
-                Question:
-                """ + query)
-            .call()
-            .content();
+            response.setAnswer(markdown);
+            response.setSource("Hybrid Multi-Embedding AI");
 
-            Map<String, Object> res = new HashMap<>();
-            res.put("status", "success");
-            res.put("count", rows.size());
-            res.put("data", rows);
-            res.put("answer_md", markdown);
-
-            return mapper.writeValueAsString(res);
+            return response;
 
         } catch (Exception e) {
             e.printStackTrace();
-            return "{\"status\":\"error\",\"message\":\"Failed\"}";
+            response.setAnswer("Error processing request");
+            response.setSource("System Error");
+            return response;
         }
     }
 
     // ================= SQL =================
-    private String buildSQL(String query, QueryIntent intent, LocalDateTime[] range) {
+    private String buildSQL(QueryIntent intent, LocalDateTime[] range) {
 
         StringBuilder sql = new StringBuilder("""
             SELECT 
                 a.message,
                 a.start_time,
+                a.inference_analysis,
                 l.incident_category,
-                l.risk_assessment
+                l.risk_assessment,
+                l.recommended_action::text AS recommended_action,
+                l.next_action::text AS next_action,
+                COALESCE(asset.device_names, '') AS device_names,
+                COALESCE(asset.camera_names, '') AS camera_names
             FROM cc_alerts_alert a
             LEFT JOIN cc_alerts_alertllmresponse l 
                 ON a.llm_response_id = l.id
+            LEFT JOIN LATERAL (
+                SELECT string_agg(DISTINCT d.name, ', ') AS device_names,
+                       string_agg(DISTINCT c.name, ', ') AS camera_names
+                FROM cc_alerts_alertdevice ad
+                LEFT JOIN devices d ON d.id = ad.device_id
+                LEFT JOIN cc_alerts_sensoralert sa ON sa.id = ad.sensor_alert_id
+                LEFT JOIN field_units_camera c ON c.id = sa.camera_id
+                WHERE ad.alert_id = a.id
+            ) asset ON true
+            INNER JOIN alert_embeddings e
+                ON a.id = e.alert_id
             WHERE a.is_active = true
         """);
 
-        // ✅ DATE
+        // DATE FILTER
         if (range != null) {
             sql.append(" AND a.start_time BETWEEN ? AND ?");
         }
 
-        // ✅ SPECIAL CASE: smoke but no flames
-        if (query.toLowerCase().contains("smoke")
-                && query.toLowerCase().contains("no")
-                && query.toLowerCase().contains("flame")) {
-
-            sql.append("""
-                AND a.message ILIKE '%smoke%'
-                AND a.message NOT ILIKE '%flame%'
-            """);
-
-        } else if (intent.getObject() != null) {
+        // TEXT FILTER
+        if (intent.getObject() != null) {
             sql.append(" AND (a.message ILIKE ? OR l.incident_category ILIKE ?)");
         }
 
-        sql.append(" ORDER BY a.start_time DESC LIMIT 20");
+        // 🔥 MULTI-EMBEDDING SCORING
+        sql.append("""
+            ORDER BY (
+                0.5 * (e.embedding_event <=> CAST(? AS vector)) +
+                0.3 * (e.embedding_risk <=> CAST(? AS vector)) +
+                0.2 * (e.embedding_action <=> CAST(? AS vector))
+            )
+        """);
+
+        sql.append(" NULLS LAST LIMIT 20");
 
         return sql.toString();
     }
 
     // ================= PARAMS =================
-    private List<Object> buildParams(String query,
-                                    QueryIntent intent,
+    private List<Object> buildParams(QueryIntent intent,
                                     LocalDateTime[] range,
                                     String vec) {
 
         List<Object> params = new ArrayList<>();
 
+        // DATE
         if (range != null) {
             params.add(range[0]);
             params.add(range[1]);
         }
 
-        // ⚠️ IMPORTANT: Only add params if placeholders exist
-        if (intent.getObject() != null
-                && !(query.toLowerCase().contains("smoke")
-                && query.toLowerCase().contains("no"))) {
-
+        // TEXT
+        if (intent.getObject() != null) {
             String pattern = "%" + intent.getObject() + "%";
             params.add(pattern);
             params.add(pattern);
         }
+
+        // 🔥 VECTOR (3 TIMES)
+        params.add(vec); // event
+        params.add(vec); // risk
+        params.add(vec); // action
 
         return params;
     }
@@ -150,13 +168,11 @@ public class ChatService {
     // ================= INTENT =================
     private QueryIntent parseIntent(String query) {
         try {
-            String res = chatClient.prompt().user("""
-                Extract intent JSON:
-                { "type":"LIST", "object":"gun" }
-                Query:
-                """ + query)
-            .call()
-            .content();
+            String res = aiProvider.generateAnswer(
+                    "Return only JSON: {\"type\":\"LIST\",\"object\":\"gun\"}",
+                    "",
+                    query
+            );
 
             return mapper.readValue(res, QueryIntent.class);
         } catch (Exception e) {
@@ -167,15 +183,17 @@ public class ChatService {
     // ================= DATE =================
     private LocalDateTime[] extractDate(String query) {
         try {
-            String res = chatClient.prompt().user("""
-                Extract date JSON:
-                {"start":"YYYY-MM-DD HH:mm:ss","end":"YYYY-MM-DD HH:mm:ss"}
-                Query:
-                """ + query)
-            .call()
-            .content();
+            String res = aiProvider.generateAnswer(
+                    "Return JSON only: {\"start\":\"YYYY-MM-DD HH:mm:ss\",\"end\":\"YYYY-MM-DD HH:mm:ss\"}",
+                    "",
+                    query
+            );
 
             Map<?, ?> map = mapper.readValue(res, Map.class);
+
+            if (map.get("start") == null || map.get("end") == null) {
+                return null;
+            }
 
             return new LocalDateTime[]{
                     LocalDateTime.parse(((String) map.get("start")).replace(" ", "T")),
@@ -188,15 +206,16 @@ public class ChatService {
     }
 
     // ================= MAP =================
-    private String mapRow(ResultSet rs) {
-        try {
-            return rs.getString("message") +
-                    " | Category: " + rs.getString("incident_category") +
-                    " | Risk: " + rs.getString("risk_assessment") +
-                    " | Time: " + rs.getTimestamp("start_time");
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
+    private String mapRow(ResultSet rs) throws SQLException {
+        return rs.getString("message") +
+                " | Analysis: " + rs.getString("inference_analysis") +
+                " | Category: " + rs.getString("incident_category") +
+                " | Risk: " + rs.getString("risk_assessment") +
+                " | Recommended action: " + rs.getString("recommended_action") +
+                " | Next action: " + rs.getString("next_action") +
+                " | Device: " + rs.getString("device_names") +
+                " | Camera: " + rs.getString("camera_names") +
+                " | Time: " + rs.getTimestamp("start_time");
     }
 
     // ================= VECTOR =================

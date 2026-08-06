@@ -1,6 +1,6 @@
 ai:
   provider: ${AI_PROVIDER:ollama}
   ollama:
-    base-url: http://127.0.0.1:${OLLAMA_PORT:11434}
+    base-url: ${OLLAMA_BASE_URL:http://host.docker.internal:11434}
     chat-model: ${OLLAMA_CHAT_MODEL:mistral}
     embedding-model: ${OLLAMA_EMBEDDING_MODEL:nomic-embed-text}

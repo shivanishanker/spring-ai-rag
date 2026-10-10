@@ -43,10 +43,6 @@ jobs:
           java-version: '17'
           cache: 'maven'
 
-      # Step 3: Grant execute permission for the Maven wrapper
-      - name: Make Maven wrapper executable
-        run: chmod +x mvnw
-
       # Step 4: Run unit & integration tests
       - name: Run Tests
         env:
@@ -54,11 +50,11 @@ jobs:
           SPRING_DATASOURCE_USERNAME: postgres
           SPRING_DATASOURCE_PASSWORD: postgres
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: ./mvnw clean test
+        run: mvn clean test
 
       # Step 5: Package the application into an executable JAR
       - name: Build JAR package
-        run: ./mvnw package -DskipTests
+        run: mvn package -DskipTests
 
       # Step 6: Save the built JAR as a workflow artifact
       - name: Upload JAR Artifact
